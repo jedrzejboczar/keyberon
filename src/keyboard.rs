@@ -1,7 +1,8 @@
 //! Keyboard HID device implementation.
 
-use crate::hid::{self, HidDevice, Protocol, ReportType, Subclass};
-use crate::key_code::KbHidReport;
+use usb_device::class_prelude::*;
+use usbd_hid::descriptor::generator_prelude::*;
+use usbd_hid::hid_class::{HIDClass, ReportType};
 
 /// A trait to manage keyboard LEDs.
 ///
@@ -20,64 +21,78 @@ pub trait Leds {
 }
 impl Leds for () {}
 
-#[rustfmt::skip]
-const REPORT_DESCRIPTOR: &[u8] = &[
-    0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
-    0x09, 0x06,        // Usage (Keyboard)
-    0xA1, 0x01,        // Collection (Application)
-    0x05, 0x07,        //   Usage Page (Kbrd/Keypad)
-    0x19, 0xE0,        //   Usage Minimum (0xE0)
-    0x29, 0xE7,        //   Usage Maximum (0xE7)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x01,        //   Logical Maximum (1)
-    0x95, 0x08,        //   Report Count (8)
-    0x75, 0x01,        //   Report Size (1)
-    0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-    0x95, 0x01,        //   Report Count (1)
-    0x75, 0x08,        //   Report Size (8)
-    0x81, 0x03,        //   Input (Const,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-    0x05, 0x07,        //   Usage Page (Kbrd/Keypad)
-    0x19, 0x00,        //   Usage Minimum (0x00)
-    0x29, 0xFF,        //   Usage Maximum (0xFF)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
-    0x95, 0x06,        //   Report Count (6)
-    0x75, 0x08,        //   Report Size (8)
-    0x81, 0x00,        //   Input (Data,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
-    0x05, 0x08,        //   Usage Page (LEDs)
-    0x19, 0x01,        //   Usage Minimum (Num Lock)
-    0x29, 0x05,        //   Usage Maximum (Kana)
-    0x95, 0x05,        //   Report Count (5)
-    0x75, 0x01,        //   Report Size (1)
-    0x91, 0x02,        //   Output (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
-    0x95, 0x01,        //   Report Count (1)
-    0x75, 0x03,        //   Report Size (3)
-    0x91, 0x03,        //   Output (Const,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
-    0xC0,              // End Collection
-];
+/// Keyboard report compatible with Boot Keyboard
+///
+/// A standard HID report compatible with Boot Keyboard (see HID specification, Appendix B).
+/// It can handle all modifier keys and up to 6 keys pressed at the same time.
+#[gen_hid_descriptor(
+    (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = KEYBOARD) = {
+        (usage_page = KEYBOARD, usage_min = 0xe0, usage_max = 0xe7) = {
+            #[packed_bits 8] #[item_settings data,variable,absolute] modifier = input;
+        };
+        (usage_min = 0x00, usage_max = 0xff) = {
+            #[item_settings constant,variable,absolute] reserved=input;
+        };
+        (usage_page = LEDS, usage_min = 0x01, usage_max = 0x05) = {
+            #[packed_bits 5] #[item_settings data,variable,absolute] leds = output;
+        };
+        // It would make sense to use usage_max=0xdd but boot keyboard uses 0xff. This way
+        // keycodes >= KeyCode::LCtrl (notably - "unofficial media") should still work
+        // (though these only work on linux, we should use different usage page for media).
+        (usage_page = KEYBOARD, usage_min = 0x00, usage_max = 0xff) = {
+            #[item_settings data,array,absolute] keycodes = input;
+        };
+    }
+)]
+#[derive(Default, Eq, PartialEq)]
+pub struct KeyboardReport {
+    /// Modifier keys packed bits
+    pub modifier: u8,
+    /// Boot keyboard reserved field
+    pub reserved: u8,
+    /// LED states (host -> device)
+    pub leds: u8,
+    /// Boot keyboard keycodes list
+    pub keycodes: [u8; 6],
+}
+
+const KEYBOARD_REPORT_IN_SIZE: usize = 1 + 1 + 6; // all fields besides leds
 
 /// A keyboard HID device.
-pub struct Keyboard<L> {
-    report: KbHidReport,
+pub struct HidKeyboard<'a, B: UsbBus, L> {
+    hid: HIDClass<'a, B>,
     leds: L,
 }
 
-impl<L> Keyboard<L> {
+impl<'a, B: UsbBus, L> HidKeyboard<'a, B, L> {
     /// Creates a new `Keyboard` object.
-    pub fn new(leds: L) -> Keyboard<L> {
-        Keyboard {
-            report: KbHidReport::default(),
+    pub fn new(bus: &'a UsbBusAllocator<B>, leds: L) -> HidKeyboard<'a, B, L> {
+        use usbd_hid::hid_class::*;
+        let settings = HidClassSettings {
+            subclass: HidSubClass::Boot,
+            protocol: HidProtocol::Keyboard,
+            config: ProtocolModeConfig::ForceBoot,
+            locale: HidCountryCode::NotSupported,
+        };
+        let hid = HIDClass::new_ep_in_with_settings(bus, KeyboardReport::desc(), 10, settings);
+        HidKeyboard {
+            hid,
             leds,
         }
     }
-    /// Set the current keyboard HID report.  Returns `true` if it is modified.
-    pub fn set_keyboard_report(&mut self, report: KbHidReport) -> bool {
-        if report == self.report {
-            false
-        } else {
-            self.report = report;
-            true
-        }
+
+    /// Push keyboard report to endpoint.
+    pub fn push_keyboard_report(&mut self, report: &KeyboardReport) -> usb_device::Result<()> {
+        self.hid.push_input(report)
+            .and_then(|bytes_written| {
+                // If bytes_written is different than report size then this means that the allocated
+                // endpoint size is too small, which should be a panic!
+                if bytes_written != KEYBOARD_REPORT_IN_SIZE {
+                    Err(usb_device::UsbError::BufferOverflow)
+                } else {
+                    Ok(())
+                }
+            })
     }
 
     /// Returns the underlying leds object.
@@ -86,45 +101,60 @@ impl<L> Keyboard<L> {
     }
 }
 
-impl<L: Leds> HidDevice for Keyboard<L> {
-    fn subclass(&self) -> Subclass {
-        Subclass::BootInterface
-    }
 
-    fn protocol(&self) -> Protocol {
-        Protocol::Keyboard
-    }
+impl<B: UsbBus, L: Leds> UsbClass<B> for HidKeyboard<'_, B, L> {
+    // Call appropriate methods from Leds on set_report request.
+    fn control_out(&mut self, xfer: usb_device::class_prelude::ControlOut<B>) {
+        self.hid.control_out(xfer);
 
-    fn max_packet_size(&self) -> u16 {
-        8
-    }
-
-    fn report_descriptor(&self) -> &[u8] {
-        REPORT_DESCRIPTOR
-    }
-
-    fn get_report(&mut self, report_type: ReportType, _report_id: u8) -> Result<&[u8], hid::Error> {
-        match report_type {
-            ReportType::Input => Ok(self.report.as_bytes()),
-            _ => Err(hid::Error),
+        let mut leds = 0u8;
+        if let Ok(info) = self.hid.pull_raw_report(core::slice::from_mut(&mut leds)) {
+            if info.report_type == ReportType::Output && info.report_id == 0 && info.len == 1 {
+                let bit = |i: usize| (leds & (1 << i)) != 0;
+                self.leds.num_lock(bit(0));
+                self.leds.caps_lock(bit(1));
+                self.leds.scroll_lock(bit(2));
+                self.leds.compose(bit(3));
+                self.leds.kana(bit(4));
+            }
         }
     }
 
-    fn set_report(
-        &mut self,
-        report_type: ReportType,
-        report_id: u8,
-        data: &[u8],
-    ) -> Result<(), hid::Error> {
-        if report_type == ReportType::Output && report_id == 0 && data.len() == 1 {
-            let d = data[0];
-            self.leds.num_lock(d & 1 != 0);
-            self.leds.caps_lock(d & 1 << 1 != 0);
-            self.leds.scroll_lock(d & 1 << 2 != 0);
-            self.leds.compose(d & 1 << 3 != 0);
-            self.leds.kana(d & 1 << 4 != 0);
-            return Ok(());
-        }
-        Err(hid::Error)
+    // Deletage all other methods to self.hid
+
+    fn get_configuration_descriptors(&self, writer: &mut usb_device::descriptor::DescriptorWriter) -> usb_device::Result<()> {
+        self.hid.get_configuration_descriptors(writer)
+    }
+
+    fn get_bos_descriptors(&self, writer: &mut usb_device::descriptor::BosWriter) -> usb_device::Result<()> {
+        self.hid.get_bos_descriptors(writer)
+    }
+
+    fn get_string(&self, index: usb_device::class_prelude::StringIndex, lang_id: u16) -> Option<&str> {
+        self.hid.get_string(index, lang_id)
+    }
+
+    fn reset(&mut self) {
+        self.hid.reset()
+    }
+
+    fn poll(&mut self) {
+        self.hid.poll()
+    }
+
+    fn control_in(&mut self, xfer: usb_device::class_prelude::ControlIn<B>) {
+        self.hid.control_in(xfer)
+    }
+
+    fn endpoint_setup(&mut self, addr: usb_device::endpoint::EndpointAddress) {
+        self.hid.endpoint_setup(addr)
+    }
+
+    fn endpoint_out(&mut self, addr: usb_device::endpoint::EndpointAddress) {
+        self.hid.endpoint_out(addr)
+    }
+
+    fn endpoint_in_complete(&mut self, addr: usb_device::endpoint::EndpointAddress) {
+        self.hid.endpoint_in_complete(addr)
     }
 }

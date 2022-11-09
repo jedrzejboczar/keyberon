@@ -21,14 +21,13 @@ use usb_device::prelude::*;
 pub mod action;
 pub mod chording;
 pub mod debounce;
-pub mod hid;
 pub mod key_code;
 pub mod keyboard;
 pub mod layout;
 pub mod matrix;
 
 /// A handly shortcut for the keyberon USB class type.
-pub type Class<'a, B, L> = hid::HidClass<'a, B, keyboard::Keyboard<L>>;
+pub type Class<'a, B, L> = keyboard::HidKeyboard<'a, B, L>;
 
 /// USB VIP for a generic keyboard from
 /// https://github.com/obdev/v-usb/blob/master/usbdrv/USB-IDs-for-free.txt
@@ -44,7 +43,7 @@ where
     B: usb_device::bus::UsbBus,
     L: keyboard::Leds,
 {
-    hid::HidClass::new(keyboard::Keyboard::new(leds), bus)
+    keyboard::HidKeyboard::new(bus, leds)
 }
 
 /// Constructor for a keyberon USB device.

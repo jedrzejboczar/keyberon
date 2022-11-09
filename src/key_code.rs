@@ -1,5 +1,7 @@
 //! Key code definitions.
 
+use crate::keyboard::KeyboardReport;
+
 #[allow(missing_docs)]
 /// Define a key code according to the HID specification.  Their names
 /// correspond to the american QWERTY layout.
@@ -281,9 +283,9 @@ impl KeyCode {
 #[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct KbHidReport([u8; 8]);
 
-impl core::iter::FromIterator<KeyCode> for KbHidReport {
+impl core::iter::FromIterator<KeyCode> for KeyboardReport {
     fn from_iter<T>(iter: T) -> Self
-    where
+where
         T: IntoIterator<Item = KeyCode>,
     {
         let mut res = Self::default();
@@ -294,12 +296,7 @@ impl core::iter::FromIterator<KeyCode> for KbHidReport {
     }
 }
 
-impl KbHidReport {
-    /// Returns the byte slice corresponding to the report.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
+impl KeyboardReport {
     /// Add the given key code to the report. If the report is full,
     /// it will be set to `ErrorRollOver`.
     pub fn pressed(&mut self, kc: KeyCode) {
@@ -307,16 +304,17 @@ impl KbHidReport {
         match kc {
             No => (),
             ErrorRollOver | PostFail | ErrorUndefined => self.set_all(kc),
-            kc if kc.is_modifier() => self.0[0] |= kc.as_modifier_bit(),
-            _ => self.0[2..]
+            kc if kc.is_modifier() => self.modifier |= kc.as_modifier_bit(),
+            _ => self.keycodes
                 .iter_mut()
                 .find(|c| **c == 0)
                 .map(|c| *c = kc as u8)
                 .unwrap_or_else(|| self.set_all(ErrorRollOver)),
         }
     }
+
     fn set_all(&mut self, kc: KeyCode) {
-        for c in &mut self.0[2..] {
+        for c in &mut self.keycodes.iter_mut() {
             *c = kc as u8;
         }
     }
